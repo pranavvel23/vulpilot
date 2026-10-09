@@ -18,7 +18,7 @@ class BuiltinSASTScanner:
             "cwe_id": "CWE-89",
             "owasp_category": "A03:2021-Injection",
             "description": "Constructing dynamic SQL queries using string formatting, f-strings, or string concatenation allows an attacker to manipulate SQL syntax and execute unauthorized queries or extract sensitive database contents.",
-            "pattern": r"(?i)(execute|query|raw|exec)\s*\(\s*(f[\"']|\".*?%s|\".*?\{\}|\".*?\+\s*\w+|'.*?\+\s*\w+)",
+            "pattern": r"(?i)((execute|query|raw|exec)\s*\(\s*(f[\"']|\".*?%s|\".*?\{\}|\".*?\+\s*\w+|'.*?\+\s*\w+)|(query|sql|stmt|raw_sql)\s*=\s*[\"'].*?(select|insert|update|delete|drop|where|from).*?(\+|\%|\.format|f[\"']))",
             "languages": [".py", ".js", ".ts", ".php", ".java", ".go"],
             "secure_example": "cursor.execute('SELECT * FROM users WHERE username = %s', (username,))"
         },
@@ -206,9 +206,80 @@ class BuiltinSASTScanner:
         except Exception:
             return results # Syntax error, regex will still catch
 
+        SQL_KEYWORDS = {"select", "insert", "update", "delete", "drop", "alter", "create", "truncate", "where", "from", "join"}
+
+        def contains_sql(text: str) -> bool:
+            if not isinstance(text, str):
+                return False
+            words = set(re.findall(r'\b[a-zA-Z]+\b', text.lower()))
+            return bool(words & SQL_KEYWORDS)
+
+        def is_dynamic_expr(node: ast.AST) -> bool:
+            if isinstance(node, (ast.Name, ast.Attribute, ast.Call, ast.Subscript)):
+                return True
+            if isinstance(node, ast.JoinedStr):
+                return True
+            if isinstance(node, ast.BinOp):
+                return is_dynamic_expr(node.left) or is_dynamic_expr(node.right)
+            return False
+
+        def get_str(n: ast.AST):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                return n.value
+            return None
+
+        def check_dynamic_sql(node: ast.AST) -> bool:
+            if isinstance(node, ast.JoinedStr):
+                for val in node.values:
+                    s = get_str(val)
+                    if s and contains_sql(s):
+                        return True
+                return False
+
+            if isinstance(node, ast.BinOp):
+                if isinstance(node.op, ast.Add):
+                    has_sql = False
+                    def walk_binop(n):
+                        nonlocal has_sql
+                        s = get_str(n)
+                        if s and contains_sql(s):
+                            has_sql = True
+                        elif isinstance(n, ast.BinOp):
+                            walk_binop(n.left)
+                            walk_binop(n.right)
+                    walk_binop(node)
+                    return has_sql and is_dynamic_expr(node)
+
+                elif isinstance(node.op, ast.Mod):
+                    s = get_str(node.left)
+                    return bool(s and contains_sql(s)) and is_dynamic_expr(node.right)
+
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+                    s = get_str(node.func.value)
+                    return bool(s and contains_sql(s)) and bool(node.args or node.keywords)
+
+            return False
+
+        assigned_vars = {}
+        reported_assigned_vars = set()
+
         class ASTVisitor(ast.NodeVisitor):
             def __init__(self, outer):
                 self.outer = outer
+
+            def visit_Assign(self, node):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        if check_dynamic_sql(node.value):
+                            assigned_vars[target.id] = (node, getattr(node, 'lineno', 1))
+                self.generic_visit(node)
+
+            def visit_AnnAssign(self, node):
+                if isinstance(node.target, ast.Name) and node.value:
+                    if check_dynamic_sql(node.value):
+                        assigned_vars[node.target.id] = (node, getattr(node, 'lineno', 1))
+                self.generic_visit(node)
 
             def visit_Call(self, node):
                 # Check for eval / exec calls
@@ -231,32 +302,66 @@ class BuiltinSASTScanner:
                         "status": "OPEN"
                     })
 
-                # Check for cursor.execute with f-string or JoinedStr
-                if isinstance(node.func, ast.Attribute) and node.func.attr == "execute":
-                    if node.args:
-                        first_arg = node.args[0]
-                        if isinstance(first_arg, (ast.JoinedStr, ast.BinOp)):
-                            line_no = getattr(node, 'lineno', 1)
-                            snippet = self.outer._extract_snippet(lines, line_no)
-                            results.append({
-                                "file_path": filename,
-                                "line_number": line_no,
-                                "end_line_number": line_no,
-                                "severity": "Critical",
-                                "title": "SQL Injection in execute() AST node",
-                                "cwe_id": "CWE-89",
-                                "owasp_category": "A03:2021-Injection",
-                                "description": "SQL statement constructed dynamically using string formatting inside cursor.execute().",
-                                "vulnerable_code": snippet,
-                                "secure_code_fix": "cursor.execute('SELECT * FROM users WHERE id = %s', (user_id,))",
-                                "ai_explanation": "String concatenation in cursor.execute bypasses parameterized query protection. Always pass query parameters as a tuple in the second argument.",
-                                "tool_name": "VulnPilot AST Engine",
-                                "status": "OPEN"
-                            })
+                # Check for cursor/conn/db execute/query calls with dynamic SQL or variable assigned dynamic SQL
+                is_exec_call = False
+                if isinstance(node.func, ast.Attribute) and node.func.attr in ("execute", "executemany", "raw", "query", "raw_query", "execute_query"):
+                    is_exec_call = True
+                elif isinstance(node.func, ast.Name) and node.func.id in ("execute", "raw_query", "query"):
+                    is_exec_call = True
+
+                if is_exec_call and node.args:
+                    first_arg = node.args[0]
+                    is_vuln = False
+                    if check_dynamic_sql(first_arg):
+                        is_vuln = True
+                    elif isinstance(first_arg, ast.Name) and first_arg.id in assigned_vars:
+                        is_vuln = True
+                        reported_assigned_vars.add(first_arg.id)
+
+                    if is_vuln:
+                        line_no = getattr(node, 'lineno', 1)
+                        snippet = self.outer._extract_snippet(lines, line_no)
+                        results.append({
+                            "file_path": filename,
+                            "line_number": line_no,
+                            "end_line_number": line_no,
+                            "severity": "Critical",
+                            "title": "SQL Injection via Dynamic Query Construction",
+                            "cwe_id": "CWE-89",
+                            "owasp_category": "A03:2021-Injection",
+                            "description": "SQL statement constructed dynamically using string concatenation, f-strings, or formatting inside database query execution.",
+                            "vulnerable_code": snippet,
+                            "secure_code_fix": "cursor.execute('SELECT * FROM users WHERE username = ?', (user_input,))",
+                            "ai_explanation": "String concatenation or formatting in SQL queries bypasses parameterized query protection. Always pass query parameters as a tuple/list in the second argument.",
+                            "tool_name": "VulnPilot AST Engine",
+                            "status": "OPEN"
+                        })
+
                 self.generic_visit(node)
 
         visitor = ASTVisitor(self)
         visitor.visit(tree)
+
+        for var_name, (assign_node, line_no) in assigned_vars.items():
+            if var_name not in reported_assigned_vars:
+                if not any(r["line_number"] == line_no and r["cwe_id"] == "CWE-89" for r in results):
+                    snippet = self._extract_snippet(lines, line_no)
+                    results.append({
+                        "file_path": filename,
+                        "line_number": line_no,
+                        "end_line_number": line_no,
+                        "severity": "Critical",
+                        "title": "SQL Injection via Dynamic Query String Construction",
+                        "cwe_id": "CWE-89",
+                        "owasp_category": "A03:2021-Injection",
+                        "description": "Constructing dynamic SQL query string using string concatenation, f-strings, or string formatting.",
+                        "vulnerable_code": snippet,
+                        "secure_code_fix": "query = 'SELECT * FROM users WHERE username = ?'\ncursor.execute(query, (user_input,))",
+                        "ai_explanation": "Building SQL queries by concatenating user inputs allows SQL injection. Use parameterized placeholders instead.",
+                        "tool_name": "VulnPilot AST Engine",
+                        "status": "OPEN"
+                    })
+
         return results
 
     def _extract_snippet(self, lines: List[str], line_no: int, context_lines: int = 1) -> str:
