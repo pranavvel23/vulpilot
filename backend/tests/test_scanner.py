@@ -74,5 +74,43 @@ class TestSQLInjectionScanner(unittest.TestCase):
         self.assertEqual(data["security_score"], 100.0)
         self.assertEqual(len(data["vulnerabilities"]), 0)
 
+    def test_api_scan_upload_endpoint(self):
+        files = {
+            "file": ("vulnerable.py", self.vulnerable_code.encode("utf-8"), "text/x-python")
+        }
+        data = {
+            "project_name": "Upload SQLi Audit"
+        }
+        response = client.post("/api/scan/upload", files=files, data=data)
+        self.assertEqual(response.status_code, 200)
+        res_json = response.json()
+        self.assertEqual(res_json["status"], "completed")
+        self.assertEqual(res_json["project_name"], "Upload SQLi Audit")
+        self.assertGreater(res_json["total_vulnerabilities"], 0)
+        sqli_vulns = [v for v in res_json["vulnerabilities"] if v["cwe_id"] == "CWE-89"]
+        self.assertTrue(len(sqli_vulns) > 0, "Uploaded file must trigger CWE-89 SQL Injection finding")
+
+    def test_cors_preflight_and_headers(self):
+        # Check OPTIONS preflight request from deployed frontend origin
+        headers = {
+            "Origin": "https://vulpilot-frontend.onrender.com",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "X-API-Key, Content-Type"
+        }
+        response = client.options("/api/scan/upload", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("access-control-allow-origin"), "https://vulpilot-frontend.onrender.com")
+
+        # Check normal POST request headers from deployed frontend origin
+        files = {
+            "file": ("test.py", self.safe_code.encode("utf-8"), "text/x-python")
+        }
+        post_headers = {
+            "Origin": "https://vulpilot-frontend.onrender.com"
+        }
+        post_response = client.post("/api/scan/upload", files=files, data={"project_name": "CORS Test"}, headers=post_headers)
+        self.assertEqual(post_response.status_code, 200)
+        self.assertEqual(post_response.headers.get("access-control-allow-origin"), "https://vulpilot-frontend.onrender.com")
+
 if __name__ == "__main__":
     unittest.main()

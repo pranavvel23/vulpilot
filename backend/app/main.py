@@ -30,10 +30,28 @@ app = FastAPI(
     description="AI-Powered Vulnerability Analysis and Remediation Assistant API"
 )
 
+# Allowed Origins for CORS configuration
+allowed_origins = [
+    "https://vulpilot-frontend.onrender.com",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+    "https://vulpilot.onrender.com",
+]
+
+# Merge any additional origins from environment variable ALLOWED_ORIGINS
+env_origins = os.getenv("ALLOWED_ORIGINS")
+if env_origins:
+    for origin in env_origins.split(","):
+        cleaned = origin.strip()
+        if cleaned and cleaned not in allowed_origins:
+            allowed_origins.append(cleaned)
+
 # Enable CORS for React Vite frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -53,7 +53,8 @@ const ScanUploader = ({ onScanComplete }) => {
       if (onScanComplete) onScanComplete(res);
       setActiveTab('scan_details');
     } catch (err) {
-      showNotification('Scan failed. Ensure backend API server is running.', 'error');
+      const msg = err.response?.data?.detail || err.message || 'Scan failed.';
+      showNotification(`Scan failed: ${msg}`, 'error');
     } finally {
       setIsScanning(false);
     }
@@ -66,14 +67,16 @@ const ScanUploader = ({ onScanComplete }) => {
     }
     setIsScanning(true);
     try {
-      const res = await scanUpload(selectedFile, projectName);
+      const uploadProjectName = projectName.trim() || selectedFile.name;
+      const res = await scanUpload(selectedFile, uploadProjectName);
       showNotification(`File Scan Completed! Found ${res.total_vulnerabilities} findings.`, 'success');
       await loadScans();
       setCurrentScan(res);
       if (onScanComplete) onScanComplete(res);
       setActiveTab('scan_details');
     } catch (err) {
-      showNotification('File upload scan failed.', 'error');
+      const msg = err.response?.data?.detail || err.message || 'File upload scan failed.';
+      showNotification(`File upload scan failed: ${msg}`, 'error');
     } finally {
       setIsScanning(false);
     }
@@ -187,6 +190,17 @@ const ScanUploader = ({ onScanComplete }) => {
         </div>
       ) : (
         <div className="space-y-6">
+          <div>
+            <label className="text-xs font-semibold text-slate-400 block mb-1">Audit Project Name</label>
+            <input
+              type="text"
+              value={projectName}
+              onChange={(e) => setProjectName(e.target.value)}
+              placeholder="e.g. Web API Audit"
+              className="w-full bg-slate-900 border border-slate-700/80 rounded-xl px-3.5 py-2 text-xs text-slate-100 focus:outline-none focus:border-cyan-500"
+            />
+          </div>
+
           <div className="border-2 border-dashed border-slate-700 hover:border-cyan-500/60 rounded-2xl p-10 text-center space-y-3 transition-colors bg-slate-900/40">
             <Upload className="w-10 h-10 text-cyan-400 mx-auto" />
             <div>

@@ -1,6 +1,6 @@
 import axios from 'axios';
 
-const API_BASE_URL = 'http://localhost:8000/api';
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'https://vulpilot.onrender.com/api';
 
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,
@@ -36,9 +36,7 @@ export const scanUpload = async (file, projectName) => {
   formData.append('file', file);
   if (projectName) formData.append('project_name', projectName);
 
-  const response = await apiClient.post('/scan/upload', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' },
-  });
+  const response = await apiClient.post('/scan/upload', formData);
   return response.data;
 };
 
